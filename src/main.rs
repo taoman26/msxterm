@@ -15,15 +15,14 @@ use std::net::{Shutdown, TcpStream};
 use std::thread;
 
 use rustyline::config::Configurer;
-//use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use rustyline::{DefaultEditor, EditMode, ExternalPrinter, Result, error::ReadlineError};
 use std::collections::{BTreeMap, HashMap};
 use clap::Parser;
 use std::fs::File;
 use std::io::{BufRead, Write, BufReader,BufWriter};
-use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 //use serialport::{ SerialPort, SerialPortType, available_ports};
 use serial2::{SerialPort};
 //use crate::connection::{TcpConnection, SerialConnection};
@@ -75,13 +74,26 @@ fn hex2u8(hex: &str) -> Vec<u8> {
 }
 
 //
+// コマンド行の引数（ファイルパス）を取り出す
+// 空白を含むパスはダブルクォートで囲む。引数が無ければ None
+//
+fn parse_path_arg(command_line: &str) -> Option<String> {
+    let rest = command_line.trim().splitn(2, char::is_whitespace).nth(1)?.trim();
+    if let Some(quoted) = rest.strip_prefix('"') {
+        let end = quoted.find('"').unwrap_or(quoted.len());
+        let path = &quoted[..end];
+        return if path.is_empty() { None } else { Some(path.to_string()) };
+    }
+    rest.split_whitespace().next().map(|p| p.to_string())
+}
+
+//
 // 指定されたファイルをロードしてvec<String>を返す
 //
 fn load(command_line: &str) -> Result<Vec<String>> {
-    let tokens: Vec<&str> = command_line.split(' ').collect();
-    let path_str = tokens[1];
-    // ファイルのパス
-    let path = PathBuf::from(path_str.trim_matches('\"'));
+    let path = parse_path_arg(command_line).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Usage: #load <file>")
+    })?;
     let file = File::open(path)?;
     let reader = BufReader::new(file);       
     let mut lines = Vec::new();
@@ -171,25 +183,20 @@ impl Msxterm {
         self.prog_buff.clear();
     }
 
-    pub fn save_program(&self, command_line:&str) {
-        let tokens: Vec<&str> = command_line.split(' ').collect();
-        let path_str = tokens[1];
-        // ファイルのパス
-        let path = PathBuf::from(path_str.trim_matches('\"'));
-        // ファイルを作成する
-        let file = File::create(path).expect("Failed to create file");
-        // ファイルに書き込むためのBufWriterを作成する
+    pub fn save_program(&self, command_line: &str) -> std::result::Result<usize, String> {
+        let path = parse_path_arg(command_line).ok_or("Usage: #save <file>")?;
+        if self.prog_buff.is_empty() {
+            return Err("Program buffer is empty. Nothing saved. (use #reload_from to fetch the program from MSX0)".to_string());
+        }
+        let file = File::create(&path).map_err(|e| format!("{}: {}", path, e))?;
         let mut writer = BufWriter::new(file);
-
-        // BTreeMapを文字列に変換してファイルに書き込む
         for (line_number, program) in self.prog_buff.iter() {
             let line = format!("{} {}\n", line_number, program);
-            writer.write_all(line.as_bytes()).expect("Failed to write to file");
+            writer.write_all(line.as_bytes()).map_err(|e| format!("{}: {}", path, e))?;
         }
-        // ファイルをクローズする
-        writer.flush().expect("Failed to flush buffer");
-    }    
-
+        writer.flush().map_err(|e| format!("{}: {}", path, e))?;
+        Ok(self.prog_buff.len())
+    }
 
 }
 
@@ -206,6 +213,43 @@ pub fn parse_command(command: &str) -> (Option<u16>, Option<u16>) {
             (start, end)
         }
     }
+}
+
+// #reload_from 用: 受信スレッドが list の出力を取り込むための共有領域
+struct Capture {
+    lines: Vec<String>,
+    done: bool,
+    last_rx: Instant,
+}
+type SharedCapture = Arc<Mutex<Option<Capture>>>;
+
+// MSX0 に list を送り、行番号付きの行を集めて返す
+fn fetch_program(stream: &mut TcpStream, capture: &SharedCapture) -> std::result::Result<Vec<String>, String> {
+    *capture.lock().unwrap() = Some(Capture { lines: Vec::new(), done: false, last_rx: Instant::now() });
+    if let Err(e) = stream.write_all(&[b'l', b'i', b's', b't', C_CR as u8]) {
+        capture.lock().unwrap().take();
+        return Err(format!("Failed to write to server: {}", e));
+    }
+    let start = Instant::now();
+    let timed_out = loop {
+        thread::sleep(Duration::from_millis(20));
+        let guard = capture.lock().unwrap();
+        let cap = guard.as_ref().unwrap();
+        if cap.done {
+            break false;
+        }
+        if cap.lines.is_empty() && start.elapsed() > Duration::from_secs(5) {
+            break true;
+        }
+        if !cap.lines.is_empty() && cap.last_rx.elapsed() > Duration::from_secs(1) {
+            break false;
+        }
+    };
+    let cap = capture.lock().unwrap().take().unwrap();
+    if timed_out {
+        return Err("No response from MSX0 (timeout). Program buffer is unchanged.".to_string());
+    }
+    Ok(cap.lines)
 }
 
 enum Command {
@@ -377,6 +421,10 @@ fn main() -> Result<()> {
     // 通信スレッドとメインスレッド間でやりとりするチャンネルを作成する
     let (tx, rx): (Sender<Command>, Receiver<Command>) = channel();
 
+    // #reload_from 用の共有領域
+    let capture: SharedCapture = Arc::new(Mutex::new(None));
+    let capture_rx = Arc::clone(&capture);
+
     // 受信用スレッドを作成
     let stream_clone = stream.try_clone().expect("Failed to clone stream");
     let receive_thread = thread::spawn(move || {
@@ -404,6 +452,23 @@ fn main() -> Result<()> {
                 Err(e) => {
                     printer.print(e.to_string()).expect("External print failure");
                     break;
+                }
+            }
+            if let Ok(mut guard) = capture_rx.lock() {
+                if let Some(cap) = guard.as_mut() {
+                    let text = if kanji_mode {
+                        msxcode::msx_kanji_to_string(byte_buff)
+                    } else {
+                        msxcode::msx_ascii_to_string(byte_buff)
+                    };
+                    let text = text.trim();
+                    cap.last_rx = Instant::now();
+                    if text == "Ok" {
+                        cap.done = true;
+                    } else if text.starts_with(|c: char| c.is_ascii_digit()) {
+                        cap.lines.push(text.to_string());
+                    }
+                    continue;
                 }
             }
             if dump_mode {
@@ -508,12 +573,12 @@ fn main() -> Result<()> {
                                 stream
                                 .write(ld_program.as_bytes())
                                 .expect("Failed to write to server");
+                                println!("Ok");
                             },
                             Err(e) => {
                                 println!("{}", e);
                             }
                         }
-                        println!("Ok");
                         continue;
                     }
                     if line.starts_with("#list") {
@@ -524,8 +589,23 @@ fn main() -> Result<()> {
                         continue;
                     }
                     if line.starts_with("#save") {
-                        msxterm.save_program(line);
-                        println!("Ok");
+                        match msxterm.save_program(line) {
+                            Ok(n) => println!("Ok ({} lines saved)", n),
+                            Err(e) => println!("{}", e),
+                        }
+                        continue;
+                    }
+                    if line.starts_with("#reload_from") {
+                        match fetch_program(&mut stream, &capture) {
+                            Ok(lines) => {
+                                msxterm.prog_buff.clear();
+                                for l in &lines {
+                                    msxterm.parse_basic(l);
+                                }
+                                println!("Ok ({} lines loaded from MSX0)", msxterm.prog_buff.len());
+                            },
+                            Err(e) => println!("{}", e),
+                        }
                         continue;
                     }
 
@@ -581,4 +661,26 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[test]
+fn test_parse_path_arg() {
+    assert_eq!(parse_path_arg("#save"), None);
+    assert_eq!(parse_path_arg("#save "), None);
+    assert_eq!(parse_path_arg("#save \"\""), None);
+    assert_eq!(parse_path_arg("#save a.bas"), Some("a.bas".to_string()));
+    assert_eq!(parse_path_arg("#save  a.bas"), Some("a.bas".to_string()));
+    assert_eq!(parse_path_arg("#save \"with space.bas\""), Some("with space.bas".to_string()));
+    assert_eq!(parse_path_arg("#load \"c:\\my file name\""), Some("c:\\my file name".to_string()));
+}
+
+#[test]
+fn test_save_program_errors() {
+    let mt = Msxterm::new();
+    assert!(mt.save_program("#save").is_err());
+    assert!(mt.save_program("#save /nonexistent_dir/x.bas").is_err());
+    let mut mt = Msxterm::new();
+    mt.parse_basic("10 PRINT 1");
+    assert!(mt.save_program("#save").is_err());
+    assert!(mt.save_program("#save /nonexistent_dir/x.bas").is_err());
 }
