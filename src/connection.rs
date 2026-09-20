@@ -212,6 +212,9 @@ fn is_varid_serial_port(path: &str) -> bool {
     #[cfg(target_os = "macos")]
     const SERIAL_PORT_REGEX: &str = r"^/dev/cu\.usbserial-\w+$|^/dev/tty\..+$";
 
+    #[cfg(target_os = "haiku")]
+    const SERIAL_PORT_REGEX: &str = r"^/dev/ports/.+$";
+
     let serial_port_regex = Regex::new(SERIAL_PORT_REGEX).unwrap();
     serial_port_regex.is_match(path)
 }
