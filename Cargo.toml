@@ -11,9 +11,17 @@ license = "MIT"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-rustyline = "12.0.0"
+rustyline = "17.0.2"
 clap = { version = "4.1", features = ["derive"] }
 regex = "1.7.3"
 serial2 = "0.2.7"
 encoding_rs = "0.8.33"
+
+# Haiku (target_os = "haiku") builds need nix's `ioctl` module, which
+# upstream nix does not yet enable for this target (rustyline's unix
+# tty backend uses nix::ioctl_read_bad! to read the terminal size).
+# This points at a fork with a one-line cfg fix until it lands upstream.
+# See README.md "Haiku での対応" for details.
+[patch.crates-io]
+nix = { git = "https://github.com/taoman26/nix.git", branch = "haiku-ioctl-support" }
 

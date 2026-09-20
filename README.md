@@ -22,7 +22,7 @@ CUI で主にプログラム作成に使用する事を想定しています。
 
 ## 対応プラットフォーム
 
-* CUI のコマンドラインから起動するようになっており、Windows、mac, Linux に対応します。
+* CUI のコマンドラインから起動するようになっており、Windows、mac, Linux, Haiku に対応します。
 * Windows版、Mac版 のバイナリは Release ページからダウンロードしてください。
 * Linux の方は各自でビルドしてください。
 * 既知の問題としてWindows版の実行ファイルがウィルスと検知される場合があるようです。
@@ -46,6 +46,20 @@ CUI で主にプログラム作成に使用する事を想定しています。
 > cd msxterm
 > cargo install --path ./
 ```
+
+### Haiku での対応について
+
+Haiku (x86_64-unknown-haiku) でも `cargo install --path ./` でビルド・動作できるようになりました。
+Haiku は Rust エコシステムでの対応がまだ薄いプラットフォームのため、下記2点の回避策を入れています。
+
+* `rustyline` は `12.0.0` ではなく `17.0.2` を使用しています。
+    * `12.0.0`〜`13.0.0` が要求する `nix` (`0.26`/`0.27`) には、Haiku 向けの `SpecialCharacterIndices` 等の実装がまだ入っておらずビルドできません。
+    * `18.0.0` 以降は履歴ファイルのロックに Rust 標準ライブラリの `std::fs::File::lock()` を使うようになりましたが、この API は Haiku ではまだ実装されておらず、`#quit` などで履歴を保存しようとすると `lock() not supported` エラーになり履歴が保存されません。
+    * その中間にあたる `17.0.2` は `fd-lock` クレート（生の `flock()` システムコール、Haiku上で動作確認済み）を使っており、上記どちらの問題も回避できます。
+* `nix` クレート自体も、`sys::ioctl` モジュールが有効になる対象OSの一覧に `haiku` が含まれておらず、`rustyline` の unix tty バックエンドが使う `nix::ioctl_read_bad!`（ターミナルサイズ取得用）がビルドできません。Haiku は既に `ioctl` の BSD 方式の番号体系には対応済み（`nix` 内の該当箇所を参照）なので、この一覧に `haiku` を1行追加するだけで解決します。
+    * 本家 `nix` へのマージ待ちのため、`Cargo.toml` の `[patch.crates-io]` でその1行だけ直した fork (https://github.com/taoman26/nix.git ブランチ `haiku-ioctl-support`) を暫定的に参照しています。
+    * 上記PRが本家にマージされ、対応バージョンが `rustyline` に取り込まれ次第、この `[patch.crates-io]` は不要になります。
+* シリアルポート接続時のデバイスパス判定 (`src/connection.rs`) に Haiku 用の正規表現 (`^/dev/ports/.+$`、例: `/dev/ports/pc_serial0`) を追加しています。
 
 ## 起動方法
 
